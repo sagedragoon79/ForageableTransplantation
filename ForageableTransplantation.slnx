@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="ForageableTransplantation.csproj" Id="0bcbec72-1a3b-4836-b4f4-d0a46aff3e2b">
+    <Platform Solution="*|x64" Project="x64" />
+  </Project>
+</Solution>
