@@ -6,7 +6,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System;
 
-[assembly: MelonInfo(typeof(ForageableTransplantation.Relocator), "Forageable Transplantation", "1.1.1", "SageDragoon")]
+[assembly: MelonInfo(typeof(ForageableTransplantation.Relocator), "Forageable Transplantation", "1.1.2", "SageDragoon")]
 [assembly: MelonGame("Crate Entertainment", "Farthest Frontier")]
 
 namespace ForageableTransplantation
@@ -98,7 +98,7 @@ namespace ForageableTransplantation
                     }
                 }
 
-                MelonLogger.Msg("Forageable Transplantation v1.1.1: Init complete.");
+                MelonLogger.Msg("Forageable Transplantation v1.1.2: Init complete.");
             }
             catch (System.Exception ex)
             {
@@ -115,9 +115,22 @@ namespace ForageableTransplantation
                 gameManager = null;
                 MelonCoroutines.Start(ScoutForageablePrefabs());
                 MelonCoroutines.Start(ApplyBuildingData());
+                // Save reload safety net: re-run ApplyBuildingData at longer intervals
+                // to handle cases where save deserialization takes longer than our
+                // initial 10s + 10x5s retry window. Idempotent — only processes
+                // forageables with null _buildingData, so already-set ones are skipped.
+                MelonCoroutines.Start(ApplyBuildingDataDelayedPass(30f));
+                MelonCoroutines.Start(ApplyBuildingDataDelayedPass(90f));
                 MelonCoroutines.Start(InitializeGameManagerDelayed());
                 MelonCoroutines.Start(YearChangeWatcher());
             }
+        }
+
+        private IEnumerator ApplyBuildingDataDelayedPass(float delay)
+        {
+            yield return new WaitForSeconds(delay);
+            MelonLogger.Msg($"ApplyBuildingData: Running safety-net pass after {delay}s delay (catches late-loaded saves).");
+            MelonCoroutines.Start(ApplyBuildingData());
         }
 
         private IEnumerator InitializeGameManagerDelayed()
