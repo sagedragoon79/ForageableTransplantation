@@ -6,7 +6,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System;
 
-[assembly: MelonInfo(typeof(ForageableTransplantation.Relocator), "Forageable Transplantation", "1.1.2", "SageDragoon")]
+[assembly: MelonInfo(typeof(ForageableTransplantation.Relocator), "Forageable Transplantation", "1.1.3", "SageDragoon")]
 [assembly: MelonGame("Crate Entertainment", "Farthest Frontier")]
 
 namespace ForageableTransplantation
@@ -98,7 +98,7 @@ namespace ForageableTransplantation
                     }
                 }
 
-                MelonLogger.Msg("Forageable Transplantation v1.1.2: Init complete.");
+                MelonLogger.Msg("Forageable Transplantation v1.1.3: Init complete.");
             }
             catch (System.Exception ex)
             {
@@ -469,54 +469,46 @@ namespace ForageableTransplantation
 
             var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy;
 
+            // Load Bush_Blueberry_Small BuildingData directly from GlobalAssets.
+            // This is the canonical serialized asset — available as soon as core game
+            // assets load, regardless of what's spawned on the current map. Works on
+            // any map type (including ones without natural blueberry spawns) and is
+            // compatible with slow settlement creation (map preview mods).
             object templateBD = null;
             System.Type buildingDataType = null;
 
             int attempts = 0;
-            while (attempts < 10)
+            const int maxAttempts = 60;  // 60 × 2s = 2 minutes — plenty for GlobalAssets init
+            while (attempts < maxAttempts)
             {
                 attempts++;
-                templateBD = null;
-                buildingDataType = null;
-
-                object fallbackBD = null;
-                foreach (var obj in Resources.FindObjectsOfTypeAll<GameObject>())
+                try
                 {
-                    if (!obj.name.ToLower().Contains("blueberry")) continue;
-                    var comp = obj.GetComponent("ForageableResource");
-                    if (comp == null) continue;
-                    var bdField = comp.GetType().GetField("_buildingData", flags);
-                    if (bdField == null) continue;
-                    var bd = bdField.GetValue(comp);
-                    if (bd == null) continue;
-                    var bdType = bd.GetType();
-                    var idField = bdType.GetField("identifier", flags);
-                    string identifier = idField != null ? idField.GetValue(bd) as string : null;
-                    if (identifier == "Bush_Blueberry_Small")
+                    var bd = GlobalAssets.buildingSetupData?.GetBuildingData("Bush_Blueberry_Small");
+                    if (bd != null)
                     {
                         templateBD = bd;
-                        buildingDataType = bdType;
+                        buildingDataType = bd.GetType();
+                        MelonLogger.Msg($"ApplyBuildingData: Loaded 'Bush_Blueberry_Small' from GlobalAssets (attempt {attempts}).");
                         break;
                     }
-                    if (fallbackBD == null)
-                    {
-                        fallbackBD = bd;
-                        buildingDataType = bdType;
-                    }
                 }
-                if (templateBD == null && fallbackBD != null)
+                catch (System.Exception ex)
                 {
-                    templateBD = fallbackBD;
-                    MelonLogger.Warning("ApplyBuildingData: Bush_Blueberry_Small not found, using fallback blueberry template.");
+                    if (attempts <= 3)
+                        MelonLogger.Warning($"ApplyBuildingData: GlobalAssets access error: {ex.Message}");
                 }
 
-                if (templateBD != null) break;
-
-                MelonLogger.Warning($"ApplyBuildingData: No blueberry template found (attempt {attempts}/10), retrying in 5s...");
-                yield return new WaitForSeconds(5f);
+                if (attempts <= 3 || attempts % 20 == 0)
+                    MelonLogger.Warning($"ApplyBuildingData: GlobalAssets not ready yet (attempt {attempts}/{maxAttempts}), retrying...");
+                yield return new WaitForSeconds(2f);
             }
 
-            if (templateBD == null) { MelonLogger.Error("ApplyBuildingData: No blueberry template found after all attempts. Giving up."); yield break; }
+            if (templateBD == null)
+            {
+                MelonLogger.Error("ApplyBuildingData: Could not load Bush_Blueberry_Small from GlobalAssets after 2 minutes.");
+                yield break;
+            }
 
             MelonLogger.Msg("Forageable Transplantation: Applying BuildingData...");
 
