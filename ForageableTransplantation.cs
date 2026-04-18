@@ -6,7 +6,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System;
 
-[assembly: MelonInfo(typeof(ForageableTransplantation.Relocator), "Forageable Transplantation", "1.1.3", "SageDragoon")]
+[assembly: MelonInfo(typeof(ForageableTransplantation.Relocator), "Forageable Transplantation", "1.1.4", "SageDragoon")]
 [assembly: MelonGame("Crate Entertainment", "Farthest Frontier")]
 
 namespace ForageableTransplantation
@@ -98,7 +98,7 @@ namespace ForageableTransplantation
                     }
                 }
 
-                MelonLogger.Msg("Forageable Transplantation v1.1.3: Init complete.");
+                MelonLogger.Msg("Forageable Transplantation v1.1.4: Init complete.");
             }
             catch (System.Exception ex)
             {
@@ -361,7 +361,7 @@ namespace ForageableTransplantation
             }
         }
 
-        public static void SpawnForageableAtDestination(string baseName, PendingRelocation pending)
+        public static void SpawnForageableAtDestination(string baseName, PendingRelocation pending, GameObject blueberryToDestroy = null)
         {
             var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy;
 
@@ -445,21 +445,12 @@ namespace ForageableTransplantation
             spawned.SetActive(true);
             MelonLogger.Msg($"SpawnForageableAtDestination: SUCCESS - '{baseName}' at {pending.destination}");
 
-            MelonCoroutines.Start(CleanupBlueberry(pending.destination, spawned));
-        }
-
-        private static IEnumerator CleanupBlueberry(Vector3 destination, GameObject keepObj)
-        {
-            yield return new WaitForSeconds(0.5f);
-            foreach (var obj in Resources.FindObjectsOfTypeAll<GameObject>())
+            // Directly destroy the blueberry clone that the game built at the
+            // destination. We have a direct reference from OnBuiltPrefabInstantiated.
+            if (blueberryToDestroy != null && blueberryToDestroy != spawned)
             {
-                if (obj == keepObj) continue;
-                if (Vector3.Distance(obj.transform.position, destination) < 3f)
-                    if (obj.GetComponent("ForageableResource") != null && obj.name.ToLower().Contains("blueberry"))
-                    {
-                        MelonLogger.Msg($"CleanupBlueberry: Destroying {obj.name}");
-                        GameObject.Destroy(obj);
-                    }
+                MelonLogger.Msg($"Destroying intermediate blueberry: {blueberryToDestroy.name}");
+                GameObject.Destroy(blueberryToDestroy);
             }
         }
 
@@ -737,8 +728,10 @@ namespace ForageableTransplantation
                 if (Relocator.PendingRelocations.Count == 0) return;
                 Component buildSiteComp = __instance as Component;
                 if (buildSiteComp == null) return;
+                // __0 is the built instance (blueberry clone) — cast to GameObject
+                GameObject builtObj = __0 as GameObject;
                 MelonLogger.Msg($"OnBuiltPrefabInstantiated (terrain) at {buildSiteComp.transform.position}");
-                HandleCompletion(buildSiteComp);
+                HandleCompletion(buildSiteComp, builtObj);
             }
             catch (System.Exception ex) { MelonLogger.Error($"OnBuiltPrefabInstantiatedTerrain error: {ex}"); }
         }
@@ -751,12 +744,12 @@ namespace ForageableTransplantation
                 Component buildSiteComp = __instance as Component;
                 if (buildSiteComp == null) return;
                 MelonLogger.Msg($"OnBuiltPrefabInstantiated (base) at {buildSiteComp.transform.position}");
-                HandleCompletion(buildSiteComp);
+                HandleCompletion(buildSiteComp, builtInstance);
             }
             catch (System.Exception ex) { MelonLogger.Error($"OnBuiltPrefabInstantiatedBase error: {ex}"); }
         }
 
-        private static void HandleCompletion(Component buildSiteComp)
+        private static void HandleCompletion(Component buildSiteComp, GameObject blueberryToDestroy)
         {
             foreach (var kvp in new Dictionary<int, Relocator.PendingRelocation>(Relocator.PendingRelocations))
             {
@@ -766,7 +759,7 @@ namespace ForageableTransplantation
                 {
                     MelonLogger.Msg($"HandleCompletion: Matched '{pending.baseName}' (id={kvp.Key}). Spawning.");
                     Relocator.PendingRelocations.Remove(kvp.Key);
-                    Relocator.SpawnForageableAtDestination(pending.baseName, pending);
+                    Relocator.SpawnForageableAtDestination(pending.baseName, pending, blueberryToDestroy);
                     return;
                 }
             }
