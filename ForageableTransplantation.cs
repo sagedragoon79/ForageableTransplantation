@@ -13,6 +13,17 @@ namespace ForageableTransplantation
 {
     public class Relocator : MelonMod
     {
+        // ── Config ───────────────────────────────────────────────────────────
+        public static MelonPreferences_Entry<bool> ModEnabled;
+        public static MelonPreferences_Entry<bool> RelocateHerbs;
+        public static MelonPreferences_Entry<bool> RelocateMushrooms;
+        public static MelonPreferences_Entry<bool> RelocateGreens;
+        public static MelonPreferences_Entry<bool> RelocateRoots;
+        public static MelonPreferences_Entry<bool> RelocateNuts;
+        public static MelonPreferences_Entry<bool> RelocateWillow;
+        public static MelonPreferences_Entry<bool> RelocateBerries;
+        public static MelonPreferences_Entry<int>  GoldCostToRelocate;
+
         public static Dictionary<int, PendingRelocation> PendingRelocations
             = new Dictionary<int, PendingRelocation>();
 
@@ -35,6 +46,37 @@ namespace ForageableTransplantation
 
         public override void OnInitializeMelon()
         {
+            // ── Config setup ────────────────────────────────────────────────
+            var cat = MelonPreferences.CreateCategory("ForageableTransplantation");
+
+            ModEnabled = cat.CreateEntry("ModEnabled", true,
+                display_name: "Mod Enabled",
+                description: "Master switch to enable/disable the mod. Requires game restart to take effect.");
+
+            RelocateHerbs = cat.CreateEntry("RelocateHerbs", true,
+                display_name: "Relocate Herbs", description: "Allow relocating herb patches.");
+            RelocateMushrooms = cat.CreateEntry("RelocateMushrooms", true,
+                display_name: "Relocate Mushrooms", description: "Allow relocating mushroom clusters.");
+            RelocateGreens = cat.CreateEntry("RelocateGreens", true,
+                display_name: "Relocate Greens", description: "Allow relocating greens patches.");
+            RelocateRoots = cat.CreateEntry("RelocateRoots", true,
+                display_name: "Relocate Roots", description: "Allow relocating root concentrations.");
+            RelocateNuts = cat.CreateEntry("RelocateNuts", true,
+                display_name: "Relocate Nuts", description: "Allow relocating hazelnut bushes.");
+            RelocateWillow = cat.CreateEntry("RelocateWillow", true,
+                display_name: "Relocate Willow", description: "Allow relocating willow bushes.");
+            RelocateBerries = cat.CreateEntry("RelocateBerries", true,
+                display_name: "Relocate Berries", description: "Allow relocating berry bushes (hawthorn, sumac).");
+            GoldCostToRelocate = cat.CreateEntry("GoldCostToRelocate", 0,
+                display_name: "Gold Cost to Relocate",
+                description: "Gold required per relocation (0 = free, just labor). Applied to all forageable types.");
+
+            if (!ModEnabled.Value)
+            {
+                LoggerInstance.Msg("Forageable Transplantation is DISABLED via config.");
+                return;
+            }
+
             try
             {
                 var harmony = new HarmonyLib.Harmony("com.sagedragoon.forageabletransplantation");
@@ -544,6 +586,8 @@ namespace ForageableTransplantation
             object val_clearingMode = f_buildsiteClearingMode?.GetValue(templateBD);
             object val_clearBorder = f_clearDetailsBorder?.GetValue(templateBD);
 
+            int goldCost = GoldCostToRelocate.Value;
+
             int count = 0;
             foreach (var obj in Resources.FindObjectsOfTypeAll<GameObject>())
             {
@@ -551,6 +595,17 @@ namespace ForageableTransplantation
                 if (comp == null) continue;
                 if (obj.name.ToLower().Contains("blueberry")) continue;
                 if (obj.name.ToLower().Contains("deco")) continue;
+
+                // Per-type config filter
+                string nameLower = obj.name.ToLower();
+                if (nameLower.Contains("herb") && !RelocateHerbs.Value) continue;
+                if (nameLower.Contains("mushroom") && !RelocateMushrooms.Value) continue;
+                if (nameLower.Contains("greens") && !RelocateGreens.Value) continue;
+                if (nameLower.Contains("roots") && !RelocateRoots.Value) continue;
+                if (nameLower.Contains("hazelnut") && !RelocateNuts.Value) continue;
+                if (nameLower.Contains("willow") && !RelocateWillow.Value) continue;
+                if ((nameLower.Contains("hawthorn") || nameLower.Contains("sumac")) && !RelocateBerries.Value) continue;
+
                 var bdField = comp.GetType().GetField("_buildingData", flags);
                 if (bdField == null) continue;
                 if (bdField.GetValue(comp) != null) continue;
@@ -562,7 +617,7 @@ namespace ForageableTransplantation
                 f_destinationPrefab?.SetValue(newBD, val_destinationPrefab);
                 f_gridSize?.SetValue(newBD, val_gridSize);
                 f_placementGridSettings?.SetValue(newBD, val_placementGridSettings);
-                f_goldToRelocate?.SetValue(newBD, val_goldToRelocate);
+                f_goldToRelocate?.SetValue(newBD, goldCost > 0 ? goldCost : val_goldToRelocate);
                 f_workToConstruct?.SetValue(newBD, val_workToConstruct);
                 f_workToDeconstruct?.SetValue(newBD, val_workToDeconstruct);
                 f_defaultBuilders?.SetValue(newBD, val_defaultBuilders);
