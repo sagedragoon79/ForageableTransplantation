@@ -77,6 +77,20 @@ namespace ForageableTransplantation
                 return;
             }
 
+            // Kill switch: if Tended Wilds is loaded, FT auto-disables to avoid
+            // duplicate Harmony patches. TW already includes all FT functionality.
+            foreach (var melon in MelonBase.RegisteredMelons)
+            {
+                if (melon == this) continue;
+                string name = melon.Info?.Name ?? "";
+                if (name.IndexOf("Tended Wilds", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    LoggerInstance.Warning("Tended Wilds detected — Forageable Transplantation is auto-disabling. " +
+                        "TW already includes all FT functionality. Remove ForageableTransplantation.dll to suppress this message.");
+                    return;
+                }
+            }
+
             try
             {
                 var harmony = new HarmonyLib.Harmony("com.sagedragoon.forageabletransplantation");
