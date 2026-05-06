@@ -46,6 +46,23 @@ namespace ForageableTransplantation
 
         public override void OnInitializeMelon()
         {
+            // Kill switch FIRST — if TW is loaded, bail before creating prefs.
+            // TW is a superset of FT; running both stacks duplicate Harmony
+            // patches. Bailing pre-prefs also keeps FT out of mod settings UIs
+            // (Keep Clarity, MelonPrefManager, etc.) where its dormant entries
+            // would otherwise show as live controls that do nothing.
+            foreach (var melon in MelonBase.RegisteredMelons)
+            {
+                if (melon == this) continue;
+                string detName = melon.Info?.Name ?? "";
+                if (detName.IndexOf("Tended Wilds", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    LoggerInstance.Warning("Tended Wilds detected — Forageable Transplantation is auto-disabling. " +
+                        "TW already includes all FT functionality. Remove ForageableTransplantation.dll to suppress this message.");
+                    return;
+                }
+            }
+
             // ── Config setup ────────────────────────────────────────────────
             var cat = MelonPreferences.CreateCategory("ForageableTransplantation");
 
@@ -75,20 +92,6 @@ namespace ForageableTransplantation
             {
                 LoggerInstance.Msg("Forageable Transplantation is DISABLED via config.");
                 return;
-            }
-
-            // Kill switch: if Tended Wilds is loaded, FT auto-disables to avoid
-            // duplicate Harmony patches. TW already includes all FT functionality.
-            foreach (var melon in MelonBase.RegisteredMelons)
-            {
-                if (melon == this) continue;
-                string name = melon.Info?.Name ?? "";
-                if (name.IndexOf("Tended Wilds", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    LoggerInstance.Warning("Tended Wilds detected — Forageable Transplantation is auto-disabling. " +
-                        "TW already includes all FT functionality. Remove ForageableTransplantation.dll to suppress this message.");
-                    return;
-                }
             }
 
             try
@@ -155,6 +158,12 @@ namespace ForageableTransplantation
                 }
 
                 MelonLogger.Msg("Forageable Transplantation v1.1.4: Init complete.");
+
+                // Note: Keep Clarity registration intentionally happens in
+                // OnSceneWasLoaded("Map"), not here. FT loads alphabetically
+                // before KeepClarity, so its types aren't resolvable yet at
+                // OnInitializeMelon time. By the time any scene loads, every
+                // mod has finished init and KC's API is reachable.
             }
             catch (System.Exception ex)
             {
@@ -162,31 +171,62 @@ namespace ForageableTransplantation
             }
         }
 
+        private bool _kcRegistered;
+
         public override void OnSceneWasLoaded(int buildIndex, string sceneName)
         {
+            // Optional: register with Keep Clarity's settings panel once it's
+            // loaded. Done here rather than in OnInitializeMelon because of
+            // alphabetical mod load order — KC isn't reachable from FT's init.
+            if (!_kcRegistered)
+            {
+                KeepClarityIntegration.TryRegisterAll();
+                _kcRegistered = true;
+            }
+
             if (buildIndex > 0)
             {
                 lastKnownYear = -1;
                 lastKnownDayOfYear = -1;
                 gameManager = null;
                 MelonCoroutines.Start(ScoutForageablePrefabs());
-                MelonCoroutines.Start(ApplyBuildingData());
-                // Save reload safety net: re-run ApplyBuildingData at longer intervals
-                // to handle cases where save deserialization takes longer than our
-                // initial 10s + 10x5s retry window. Idempotent — only processes
-                // forageables with null _buildingData, so already-set ones are skipped.
-                MelonCoroutines.Start(ApplyBuildingDataDelayedPass(30f));
-                MelonCoroutines.Start(ApplyBuildingDataDelayedPass(90f));
+                MelonCoroutines.Start(ApplyBuildingDataChain());
                 MelonCoroutines.Start(InitializeGameManagerDelayed());
                 MelonCoroutines.Start(YearChangeWatcher());
             }
         }
 
-        private IEnumerator ApplyBuildingDataDelayedPass(float delay)
+        // Tracks the result of the most recent ApplyBuildingData run so the
+        // chain coroutine can decide whether to escalate to a safety-net pass.
+        // > 0 means the pass enabled at least one forageable (save was loaded
+        // in time) and no further passes are needed.
+        private static int _lastApplyCount = -1;
+
+        // Chain-on-failure: only escalates to a safety-net pass if the prior
+        // pass found zero forageables. On a normal load, pass 1 succeeds and
+        // the coroutine exits — no idle sleeps or wasted scans. Replaces the
+        // earlier "schedule three passes unconditionally" approach which paid
+        // the full Resources.FindObjectsOfTypeAll cost three times per load.
+        private IEnumerator ApplyBuildingDataChain()
         {
-            yield return new WaitForSeconds(delay);
-            MelonLogger.Msg($"ApplyBuildingData: Running safety-net pass after {delay}s delay (catches late-loaded saves).");
-            MelonCoroutines.Start(ApplyBuildingData());
+            // Pass 1 — initial scan after GlobalAssets is ready (10s wait
+            // lives inside ApplyBuildingData itself).
+            _lastApplyCount = -1;
+            yield return ApplyBuildingData();
+            if (_lastApplyCount > 0) yield break;
+
+            // Pass 2 — safety net for slow saves that hadn't spawned all
+            // forageables when pass 1 ran.
+            yield return new WaitForSeconds(30f);
+            MelonLogger.Msg("ApplyBuildingData: Pass 1 found 0 forageables — running safety-net pass after +30s.");
+            _lastApplyCount = -1;
+            yield return ApplyBuildingData();
+            if (_lastApplyCount > 0) yield break;
+
+            // Pass 3 — last resort for very slow loads.
+            yield return new WaitForSeconds(60f);
+            MelonLogger.Msg("ApplyBuildingData: Pass 2 still found 0 — running last-resort pass.");
+            yield return ApplyBuildingData();
         }
 
         private IEnumerator InitializeGameManagerDelayed()
@@ -275,71 +315,45 @@ namespace ForageableTransplantation
             yield return new WaitForSeconds(15f);
             MelonLogger.Msg("PrefabScout: Starting...");
 
-            foreach (var obj in Resources.FindObjectsOfTypeAll<GameObject>())
-            {
-                if (obj.scene.IsValid()) continue;
-                var forageComp = obj.GetComponent("ForageableResource");
-                if (forageComp == null) continue;
-                string baseName = obj.name.Replace("(Clone)", "").Trim().ToLower();
-                if (baseName.Contains("blueberry")) continue;
-                if (baseName.Contains("deco")) continue;
-                if (!ForageablePrefabs.ContainsKey(baseName))
-                {
-                    ForageablePrefabs.Add(baseName, obj);
-                    MelonLogger.Msg($"PrefabScout: Found '{obj.name}' -> '{baseName}' (prefab)");
-                }
-            }
-
-            foreach (var obj in Resources.FindObjectsOfTypeAll<GameObject>())
-            {
-                if (!obj.scene.IsValid()) continue;
-                var forageComp = obj.GetComponent("ForageableResource");
-                if (forageComp == null) continue;
-                string baseName = obj.name.Replace("(Clone)", "").Trim().ToLower();
-                if (baseName.Contains("blueberry")) continue;
-                if (baseName.Contains("deco")) continue;
-                if (!ForageablePrefabs.ContainsKey(baseName))
-                {
-                    ForageablePrefabs.Add(baseName, obj);
-                    MelonLogger.Msg($"PrefabScout: Found '{obj.name}' -> '{baseName}' (scene fallback)");
-                }
-            }
-
-            // Third source: ForagerShack serialized prefab fields
-            // These are asset references that exist regardless of map content
-            // Fixes maps that don't have certain forageable types spawned naturally
+            // Single ForageableResource scan replaces the previous three-pass
+            // approach (asset GameObject scan + scene GameObject scan +
+            // ForagerShack-fields fallback).
+            //
+            // The old ForagerShack-fields path returned nothing on maps where
+            // the player hadn't built or opened the build menu for a Forager
+            // Shack — the shack prefab isn't in memory until something
+            // references it. On those maps the cache stayed empty and every
+            // relocation failed with "No prefab found", landing the destination
+            // as a blueberry placeholder.
+            //
+            // ForageableResource is the component the relocation path itself
+            // checks on each candidate — anything we cache here is by
+            // definition a valid relocation target. FindObjectsOfTypeAll<T>
+            // returns both prefab assets and scene instances, so we get the
+            // asset prefabs FF loads with the map even when nothing's been
+            // built yet. Dedupe by lowercased gameObject name to match the
+            // SpawnForageableAtDestination lookup format.
             try
             {
-                string[] prefabFieldNames = new string[]
+                int loaded = 0;
+                foreach (var fr in Resources.FindObjectsOfTypeAll<ForageableResource>())
                 {
-                    "herbsPrefab", "nutsPrefab", "greensPrefab",
-                    "medicinalRootsPrefab", "mushroomsPrefab",
-                    "willowPrefab", "berriesPrefab"
-                };
-                var shackFlags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-
-                foreach (var shack in Resources.FindObjectsOfTypeAll<ForagerShack>())
-                {
-                    if (shack == null) continue;
-                    foreach (var fieldName in prefabFieldNames)
-                    {
-                        var field = typeof(ForagerShack).GetField(fieldName, shackFlags);
-                        if (field == null) continue;
-                        var prefabObj = field.GetValue(shack) as ForageableResource;
-                        if (prefabObj == null) continue;
-                        string baseName = prefabObj.gameObject.name.Replace("(Clone)", "").Trim().ToLower();
-                        if (!string.IsNullOrEmpty(baseName) && !baseName.Contains("deco") && !ForageablePrefabs.ContainsKey(baseName))
-                        {
-                            ForageablePrefabs[baseName] = prefabObj.gameObject;
-                            MelonLogger.Msg($"PrefabScout: Found '{baseName}' from ForagerShack.{fieldName}");
-                        }
-                    }
-                    break; // Only need one shack — all share the same prefab references
+                    if (fr == null) continue;
+                    var go = fr.gameObject;
+                    if (go == null) continue;
+                    string baseName = go.name.Replace("(Clone)", "").Trim().ToLower();
+                    if (string.IsNullOrEmpty(baseName)) continue;
+                    if (baseName.Contains("blueberry")) continue;
+                    if (baseName.Contains("deco")) continue;
+                    if (ForageablePrefabs.ContainsKey(baseName)) continue;
+                    ForageablePrefabs[baseName] = go;
+                    loaded++;
                 }
+                MelonLogger.Msg($"PrefabScout: Loaded {loaded} forageable prefab(s) from ForageableResource scan.");
             }
             catch (System.Exception ex)
             {
-                MelonLogger.Warning($"PrefabScout: ForagerShack prefab scan failed: {ex.Message}");
+                MelonLogger.Warning($"PrefabScout: ForageableResource scan failed: {ex.Message}");
             }
 
             MelonLogger.Msg($"PrefabScout: Found {ForageablePrefabs.Count} prefabs.");
@@ -603,10 +617,17 @@ namespace ForageableTransplantation
             int goldCost = GoldCostToRelocate.Value;
 
             int count = 0;
-            foreach (var obj in Resources.FindObjectsOfTypeAll<GameObject>())
+            // Iterate ForageableResource components directly. This skips the
+            // ~30k-object scene-wide GameObject scan (the dominant cost in
+            // this method) and the per-object string-based GetComponent —
+            // returns only the ~100-500 ForageableResource components, an
+            // O(60-300×) speedup that turns a ~1-second freeze into a few ms
+            // on populated maps. Same source TW switched to.
+            foreach (var comp in Resources.FindObjectsOfTypeAll<ForageableResource>())
             {
-                var comp = obj.GetComponent("ForageableResource");
                 if (comp == null) continue;
+                var obj = comp.gameObject;
+                if (obj == null) continue;
                 if (obj.name.ToLower().Contains("blueberry")) continue;
                 if (obj.name.ToLower().Contains("deco")) continue;
 
@@ -667,6 +688,7 @@ namespace ForageableTransplantation
                 if (count <= 5) MelonLogger.Msg($"Enabled transplantation for {obj.name}");
             }
 
+            _lastApplyCount = count;
             if (count > 0)
                 MelonLogger.Msg($"Done! Enabled {count} forageables for transplantation.");
         }
