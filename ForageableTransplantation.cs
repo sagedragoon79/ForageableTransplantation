@@ -6,7 +6,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System;
 
-[assembly: MelonInfo(typeof(ForageableTransplantation.Relocator), "Forageable Transplantation", "1.1.4", "SageDragoon")]
+[assembly: MelonInfo(typeof(ForageableTransplantation.Relocator), "Forageable Transplantation", "1.1.6", "SageDragoon")]
 [assembly: MelonGame("Crate Entertainment", "Farthest Frontier")]
 
 namespace ForageableTransplantation
@@ -335,21 +335,42 @@ namespace ForageableTransplantation
             // SpawnForageableAtDestination lookup format.
             try
             {
-                int loaded = 0;
-                foreach (var fr in Resources.FindObjectsOfTypeAll<ForageableResource>())
+                // Two-pass scan. Prefab assets (scene.IsValid() == false) are
+                // stable across the entire session; scene instances can be
+                // destroyed when the player relocates/harvests them, leaving
+                // the cache holding a Unity-null reference and breaking the
+                // next relocation of the same variant. Pass 1 grabs every
+                // prefab asset; pass 2 fills any remaining variants from
+                // scene instances as a fallback.
+                int loadedPrefabs = 0, loadedInstances = 0;
+                var all = Resources.FindObjectsOfTypeAll<ForageableResource>();
+                foreach (var fr in all)
                 {
                     if (fr == null) continue;
                     var go = fr.gameObject;
-                    if (go == null) continue;
+                    if (go == null || go.scene.IsValid()) continue; // pass 1: prefabs only
                     string baseName = go.name.Replace("(Clone)", "").Trim().ToLower();
                     if (string.IsNullOrEmpty(baseName)) continue;
                     if (baseName.Contains("blueberry")) continue;
                     if (baseName.Contains("deco")) continue;
                     if (ForageablePrefabs.ContainsKey(baseName)) continue;
                     ForageablePrefabs[baseName] = go;
-                    loaded++;
+                    loadedPrefabs++;
                 }
-                MelonLogger.Msg($"PrefabScout: Loaded {loaded} forageable prefab(s) from ForageableResource scan.");
+                foreach (var fr in all)
+                {
+                    if (fr == null) continue;
+                    var go = fr.gameObject;
+                    if (go == null || !go.scene.IsValid()) continue; // pass 2: scene instances
+                    string baseName = go.name.Replace("(Clone)", "").Trim().ToLower();
+                    if (string.IsNullOrEmpty(baseName)) continue;
+                    if (baseName.Contains("blueberry")) continue;
+                    if (baseName.Contains("deco")) continue;
+                    if (ForageablePrefabs.ContainsKey(baseName)) continue;
+                    ForageablePrefabs[baseName] = go;
+                    loadedInstances++;
+                }
+                MelonLogger.Msg($"PrefabScout: Loaded {loadedPrefabs} prefab asset(s) + {loadedInstances} scene-instance fallback(s).");
             }
             catch (System.Exception ex)
             {
@@ -438,17 +459,35 @@ namespace ForageableTransplantation
             MelonLogger.Msg($"SpawnForageableAtDestination: '{baseName}' at {pending.destination}");
 
             GameObject prefab;
-            if (!ForageablePrefabs.TryGetValue(baseName, out prefab))
-            {
-                MelonLogger.Error($"No prefab found for '{baseName}'!");
-                return;
-            }
+            ForageablePrefabs.TryGetValue(baseName, out prefab);
 
+            // Cached entry might be Unity-null if it was a scene instance that
+            // got destroyed by a previous relocation/harvest. Or there might be
+            // no entry at all. Either way, re-scan for a fresh prefab asset
+            // before giving up — eliminates the "permanently broken after first
+            // failure" mode the prior cache had.
             if (prefab == null || !prefab)
             {
-                MelonLogger.Error($"Prefab for '{baseName}' is null or destroyed! Removing from cache.");
-                ForageablePrefabs.Remove(baseName);
-                return;
+                foreach (var fr in Resources.FindObjectsOfTypeAll<ForageableResource>())
+                {
+                    if (fr == null) continue;
+                    var go = fr.gameObject;
+                    if (go == null) continue;
+                    if (go.name.Replace("(Clone)", "").Trim().ToLower() != baseName) continue;
+                    if (!go.scene.IsValid()) { prefab = go; break; } // prefer prefab asset
+                    if (prefab == null) prefab = go;                 // scene-instance fallback
+                }
+                if (prefab != null)
+                {
+                    ForageablePrefabs[baseName] = prefab;
+                    MelonLogger.Msg($"SpawnForageableAtDestination: Re-resolved prefab for '{baseName}' (cache was stale).");
+                }
+                else
+                {
+                    MelonLogger.Error($"No prefab found for '{baseName}' after re-scan! Blueberry placeholder will remain.");
+                    ForageablePrefabs.Remove(baseName);
+                    return;
+                }
             }
 
             GameObject spawned = GameObject.Instantiate(prefab, pending.destination, Quaternion.identity);
@@ -717,6 +756,28 @@ namespace ForageableTransplantation
                 if (!Relocator.PendingRelocations.ContainsKey(instanceId))
                 {
                     var baseName = sceneObj.name.Replace("(Clone)", "").Trim().ToLower();
+
+                    // Self-healing prefab cache. By the time RelocatePrefix
+                    // fires we have a direct reference to a valid instance, but
+                    // sceneObj is the GO the player is about to delete —
+                    // caching it leaves the next relocation of the same variant
+                    // looking at a Unity-null reference. Prefer a prefab asset
+                    // (scene-less) version, fall back to sceneObj only if no
+                    // asset exists.
+                    if (!Relocator.ForageablePrefabs.TryGetValue(baseName, out var existing) || existing == null)
+                    {
+                        GameObject prefabAsset = null;
+                        foreach (var fr in Resources.FindObjectsOfTypeAll<ForageableResource>())
+                        {
+                            if (fr == null) continue;
+                            var go = fr.gameObject;
+                            if (go == null || go.scene.IsValid()) continue;
+                            if (go.name.Replace("(Clone)", "").Trim().ToLower() == baseName)
+                            { prefabAsset = go; break; }
+                        }
+                        Relocator.ForageablePrefabs[baseName] = prefabAsset != null ? prefabAsset : sceneObj;
+                    }
+
                     var f_position = constructionData.GetType().GetField("position", flags);
                     var destPos = f_position != null ? (Vector3)f_position.GetValue(constructionData) : Vector3.zero;
 
