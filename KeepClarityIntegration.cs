@@ -57,7 +57,7 @@ namespace ForageableTransplantation
                 /*version*/ null,
                 /*iconResourcePath*/ null,
                 /*accentRgb — sage green*/ new[] { 0.45f, 0.60f, 0.40f, 1f },
-                /*order*/ 40
+                /*order*/ 20
             });
         }
 
