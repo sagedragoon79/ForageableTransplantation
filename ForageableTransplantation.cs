@@ -36,6 +36,351 @@ namespace ForageableTransplantation
             public System.Collections.IDictionary replenishRates;
             public System.Collections.IDictionary maxReplenishRates;
             public List<int[]> seasonWindows;
+            // Name→rate copies for records restored from a save reload: the live
+            // Item references can't be serialized, so restored records carry names
+            // and re-resolve them at spawn time (see SpawnForageableAtDestination).
+            public Dictionary<string, uint> savedRates;
+            public Dictionary<string, uint> savedMaxRates;
+            // True once a build site has been linked to this record. A destroyed
+            // site compares Unity-== null, so without this flag a cancelled
+            // relocation's record would "look unlinked" and re-arm against the
+            // next unrelated build site within range.
+            public bool linkedOnce;
+            // True for records rebuilt from the pref after a save reload.
+            public bool restored;
+        }
+
+        // =====================================================================
+        // Persistence: in-flight relocations survive a save/reload.
+        //
+        // FF saves the placeholder build site as part of the save file, but the
+        // swap record used to live only in memory — reload mid-relocation and
+        // the placeholder completed as a literal blueberry bush. Every mutation
+        // of PendingRelocations now rewrites a hidden per-save pref, and map
+        // load restores the current save's records (nativeConstructSite = null;
+        // completion matches those by position instead of by site reference).
+        //
+        // Pref format, one record per line:
+        //   saveName\tbaseName\tx;y;z\tname=rate,...\tname=rate,...\tstart-end,...
+        // =====================================================================
+        public static MelonPreferences_Entry<string> PendingDataPref; // created in OnInitializeMelon (null when TW kill-switch fired)
+
+        // Synthetic dict keys for restored records. NOTE: GetInstanceID() can be
+        // negative too, so uniqueness is enforced with a ContainsKey loop at the
+        // insertion site rather than assumed from the sign.
+        private static int _restoredKeyCounter = -1;
+
+        private static string CurrentSaveKey()
+        {
+            // Settlement name + map seed identify the GAME, not the file —
+            // stable across manual saves, autosaves, and Save-As of the same
+            // settlement. Keying by activeSaveFileName broke crash recovery:
+            // FF doesn't reassign it on autosave, so loading "AutoSave 1" after
+            // a crash matched nothing and the placeholder completed as a
+            // blueberry (the exact bug this feature exists to fix).
+            try
+            {
+                string name = SaveManager.activeSettlementName;
+                string seed = SettingsManager.activeMapSeed;
+                if (!string.IsNullOrEmpty(name) || !string.IsNullOrEmpty(seed))
+                    return ((name ?? "") + "|" + (seed ?? ""))
+                        .Replace('\t', ' ').Replace('\n', ' ');
+            }
+            catch { }
+            try { return (SaveManager.activeSaveFileName ?? "").Replace('\t', ' ').Replace('\n', ' '); }
+            catch { return ""; }
+        }
+
+        private static string F(float v) => v.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
+
+        private static string SerializeRates(System.Collections.IDictionary live, Dictionary<string, uint> saved)
+        {
+            var parts = new List<string>();
+            if (live != null)
+            {
+                foreach (System.Collections.DictionaryEntry e in live)
+                {
+                    var item = e.Key as Item;
+                    if (item != null && item.name != null)
+                        parts.Add(item.name + "=" + System.Convert.ToUInt32(e.Value));
+                }
+            }
+            else if (saved != null)
+            {
+                foreach (var kv in saved) parts.Add(kv.Key + "=" + kv.Value);
+            }
+            return string.Join(",", parts.ToArray());
+        }
+
+        private static Dictionary<string, uint> ParseRates(string s)
+        {
+            var dict = new Dictionary<string, uint>();
+            if (string.IsNullOrEmpty(s)) return dict;
+            foreach (var part in s.Split(','))
+            {
+                int eq = part.LastIndexOf('=');
+                if (eq <= 0) continue;
+                if (uint.TryParse(part.Substring(eq + 1), out uint rate))
+                    dict[part.Substring(0, eq)] = rate;
+            }
+            return dict;
+        }
+
+        /// <summary>Rewrite the persisted records: current save's lines are rebuilt
+        /// from the live dictionary, other saves' lines pass through untouched.</summary>
+        public static void SaveToPrefs()
+        {
+            try
+            {
+                if (PendingDataPref == null) return;
+                string save = CurrentSaveKey();
+                if (string.IsNullOrEmpty(save)) return; // unknown game identity — don't persist
+                var lines = new List<string>();
+
+                var old = PendingDataPref.Value ?? "";
+                foreach (var line in old.Split('\n'))
+                {
+                    if (line.Length == 0) continue;
+                    int tab = line.IndexOf('\t');
+                    if (tab < 0 || line.Substring(0, tab) == save) continue; // drop current save's stale lines
+                    lines.Add(line);
+                }
+
+                foreach (var pending in PendingRelocations.Values)
+                {
+                    var wins = new List<string>();
+                    if (pending.seasonWindows != null)
+                        foreach (var w in pending.seasonWindows)
+                            if (w != null && w.Length >= 2) wins.Add(w[0] + "-" + w[1]);
+                    lines.Add(save + "\t" + pending.baseName + "\t"
+                        + F(pending.destination.x) + ";" + F(pending.destination.y) + ";" + F(pending.destination.z) + "\t"
+                        + SerializeRates(pending.replenishRates, pending.savedRates) + "\t"
+                        + SerializeRates(pending.maxReplenishRates, pending.savedMaxRates) + "\t"
+                        + string.Join(",", wins.ToArray()));
+                }
+
+                PendingDataPref.Value = string.Join("\n", lines.ToArray());
+                MelonPreferences.Save(); // flush now — a crash or Alt+F4 must not lose the swap records
+            }
+            catch (System.Exception ex) { MelonLogger.Warning($"SaveToPrefs error: {ex.Message}"); }
+        }
+
+        /// <summary>Repopulate PendingRelocations with the current save's persisted
+        /// records. Called on map load after the session-state Clear().</summary>
+        public static void RestorePendingFromPrefs()
+        {
+            try
+            {
+                if (PendingDataPref == null || string.IsNullOrEmpty(PendingDataPref.Value)) return;
+                string save = CurrentSaveKey();
+                if (string.IsNullOrEmpty(save)) return; // unknown game identity — nothing to match
+                int restored = 0;
+                foreach (var line in PendingDataPref.Value.Split('\n'))
+                {
+                    // Per-line isolation: one malformed record must not abort the rest.
+                    try
+                    {
+                        var f = line.Split('\t');
+                        if (f.Length < 6 || f[0] != save) continue;
+                        var xyz = f[2].Split(';');
+                        if (xyz.Length != 3) continue;
+                        if (!float.TryParse(xyz[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float px)
+                            || !float.TryParse(xyz[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float py)
+                            || !float.TryParse(xyz[2], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float pz))
+                        {
+                            MelonLogger.Warning("Relocation persistence: skipping record with malformed coordinates.");
+                            continue;
+                        }
+                        var dest = new Vector3(px, py, pz);
+
+                        List<int[]> windows = null;
+                        if (f[5].Length > 0)
+                        {
+                            windows = new List<int[]>();
+                            foreach (var w in f[5].Split(','))
+                            {
+                                var se = w.Split('-');
+                                if (se.Length == 2 && int.TryParse(se[0], out int ws) && int.TryParse(se[1], out int we))
+                                    windows.Add(new[] { ws, we });
+                            }
+                        }
+
+                        int key = _restoredKeyCounter--;
+                        while (PendingRelocations.ContainsKey(key)) key = _restoredKeyCounter--;
+                        PendingRelocations[key] = new PendingRelocation
+                        {
+                            instanceId = 0,
+                            baseName = f[1],
+                            destination = dest,
+                            nativeConstructSite = null, // may relink via BuildSite.Initialize, else matched by position
+                            savedRates = ParseRates(f[3]),
+                            savedMaxRates = ParseRates(f[4]),
+                            seasonWindows = windows,
+                            restored = true,
+                        };
+                        restored++;
+                    }
+                    catch (System.Exception exLine)
+                    {
+                        MelonLogger.Warning($"Relocation persistence: skipping bad record line: {exLine.Message}");
+                    }
+                }
+                if (restored > 0)
+                {
+                    MelonLogger.Msg($"Relocation persistence: restored {restored} in-flight relocation(s) for '{save}'.");
+                    // Backstop: once the save has fully deserialized, drop any
+                    // restored record whose placeholder no longer exists.
+                    MelonCoroutines.Start(PurgeStaleRestoredRecords());
+                }
+            }
+            catch (System.Exception ex) { MelonLogger.Warning($"RestorePendingFromPrefs error: {ex.Message}"); }
+        }
+
+        // =====================================================================
+        // Purge: after load, drop restored records with no live placeholder.
+        // Keeps the pref self-cleaning — cancelled or already-completed
+        // relocations can never accumulate as disk zombies. A relocation saved
+        // at ORDER stage has no build site yet (FF deconstructs the source
+        // first), only its destination MARKER — so both count as alive.
+        // =====================================================================
+        private static System.Collections.IEnumerator PurgeStaleRestoredRecords()
+        {
+            float capSeconds = 120f;
+            while (!GameManager.gameReadyToPlay && capSeconds > 0f)
+            {
+                capSeconds -= 2f;
+                yield return new WaitForSecondsRealtime(2f);
+            }
+            yield return new WaitForSecondsRealtime(5f);
+
+            try
+            {
+                var stale = new List<int>();
+                BuildSite[] sites = null;
+                RelocationDestination[] destinations = null;
+                foreach (var kvp in PendingRelocations)
+                {
+                    var p = kvp.Value;
+                    if (!p.restored || p.linkedOnce || !ReferenceEquals(p.nativeConstructSite, null)) continue;
+                    if (sites == null) sites = UnityEngine.Object.FindObjectsOfType<BuildSite>();
+                    if (destinations == null) destinations = UnityEngine.Object.FindObjectsOfType<RelocationDestination>();
+                    bool placeholderExists = false;
+                    foreach (var s in sites)
+                    {
+                        if (s == null) continue;
+                        if (Vector3.Distance(s.transform.position, p.destination) < 3f) { placeholderExists = true; break; }
+                    }
+                    if (!placeholderExists)
+                    {
+                        foreach (var d in destinations)
+                        {
+                            if (d == null) continue;
+                            if (Vector3.Distance(d.transform.position, p.destination) < 3f) { placeholderExists = true; break; }
+                        }
+                    }
+                    if (!placeholderExists) stale.Add(kvp.Key);
+                }
+                foreach (var k in stale)
+                {
+                    MelonLogger.Msg($"Relocation persistence: purged stale record '{PendingRelocations[k].baseName}' (no live placeholder).");
+                    PendingRelocations.Remove(k);
+                }
+                if (stale.Count > 0) SaveToPrefs();
+            }
+            catch (System.Exception ex) { MelonLogger.Warning($"PurgeStaleRestoredRecords error: {ex.Message}"); }
+        }
+
+        // =====================================================================
+        // Cancel/demolish cleanup: a build site destroyed without completing
+        // takes its pending record with it — in memory AND on disk. Completed
+        // sites are excluded (OnBuiltPrefabInstantiated runs before
+        // DestroyBuildSite and has already consumed the record); scene teardown
+        // is excluded (that is exactly when records must survive for reload).
+        // =====================================================================
+        public static void BuildSiteOnDestroyPostfix(object __instance)
+        {
+            try
+            {
+                if (PendingRelocations.Count == 0) return;
+                var site = __instance as BuildSite;
+                if (site == null) return;
+                if (site.isComplete) return; // normal completion — record already consumed
+
+                try
+                {
+                    var csm = UnitySingletonPersistent<CESceneManager>.Instance;
+                    if (csm == null || csm.isUnloadingGame) return;
+                    var gm = UnitySingleton<GameManager>.Instance;
+                    if (gm == null || gm.isShuttingDownOrUnloading) return;
+                }
+                catch { return; }
+
+                var go = site.gameObject;
+                var pos = site.transform.position;
+                var toRemove = new List<int>();
+                foreach (var kvp in PendingRelocations)
+                {
+                    var p = kvp.Value;
+                    // ReferenceEquals sidesteps Unity's fake-null during destruction.
+                    if (!ReferenceEquals(p.nativeConstructSite, null))
+                    {
+                        if (ReferenceEquals(p.nativeConstructSite, go)) toRemove.Add(kvp.Key);
+                    }
+                    else if (!p.linkedOnce && Vector3.Distance(pos, p.destination) < 2f)
+                    {
+                        toRemove.Add(kvp.Key);
+                    }
+                }
+                foreach (var k in toRemove)
+                {
+                    MelonLogger.Msg($"Relocation cancelled: dropped pending '{PendingRelocations[k].baseName}'.");
+                    PendingRelocations.Remove(k);
+                }
+                if (toRemove.Count > 0) SaveToPrefs();
+            }
+            catch (System.Exception ex) { MelonLogger.Error($"BuildSiteOnDestroyPostfix error: {ex.Message}"); }
+        }
+
+        // =====================================================================
+        // Early-cancel cleanup: cancelling a relocation at ORDER stage (before
+        // any build site exists) destroys only the destination marker. Drop
+        // unlinked records near it. Linked records are excluded, so this can't
+        // misfire on a legitimate completion (Destroy defers OnDestroy to end
+        // of frame — the completion handler always consumes its record first).
+        // =====================================================================
+        public static void RelocationDestinationOnDestroyPostfix(object __instance)
+        {
+            try
+            {
+                if (PendingRelocations.Count == 0) return;
+                var comp = __instance as Component;
+                if (comp == null) return;
+
+                try
+                {
+                    var csm = UnitySingletonPersistent<CESceneManager>.Instance;
+                    if (csm == null || csm.isUnloadingGame) return;
+                    var gm = UnitySingleton<GameManager>.Instance;
+                    if (gm == null || gm.isShuttingDownOrUnloading) return;
+                }
+                catch { return; }
+
+                var pos = comp.transform.position;
+                var toRemove = new List<int>();
+                foreach (var kvp in PendingRelocations)
+                {
+                    var p = kvp.Value;
+                    if (p.linkedOnce || !ReferenceEquals(p.nativeConstructSite, null)) continue;
+                    if (Vector3.Distance(pos, p.destination) < 2f) toRemove.Add(kvp.Key);
+                }
+                foreach (var k in toRemove)
+                {
+                    MelonLogger.Msg($"Relocation cancelled at order stage: dropped pending '{PendingRelocations[k].baseName}'.");
+                    PendingRelocations.Remove(k);
+                }
+                if (toRemove.Count > 0) SaveToPrefs();
+            }
+            catch (System.Exception ex) { MelonLogger.Error($"RelocationDestinationOnDestroyPostfix error: {ex.Message}"); }
         }
 
         public static Dictionary<string, GameObject> ForageablePrefabs = new Dictionary<string, GameObject>();
@@ -87,6 +432,10 @@ namespace ForageableTransplantation
             GoldCostToRelocate = cat.CreateEntry("GoldCostToRelocate", 0,
                 display_name: "Gold Cost to Relocate",
                 description: "Gold required per relocation (0 = free, just labor). Applied to all forageable types.");
+            PendingDataPref = cat.CreateEntry("PendingRelocationsData", "",
+                display_name: "Pending Relocations (internal)",
+                description: "Internal state: in-flight relocation swap records, per save. Do not edit.",
+                is_hidden: true);
 
             if (!ModEnabled.Value)
             {
@@ -131,6 +480,38 @@ namespace ForageableTransplantation
                         harmony.Patch(initialize, postfix: new HarmonyLib.HarmonyMethod(
                             typeof(RelocatePatches).GetMethod("BuildSiteInitializePostfix", BindingFlags.Public | BindingFlags.Static)));
                         MelonLogger.Msg("Patched BuildSite.Initialize");
+                    }
+
+                    // Cancel/demolish cleanup: a placeholder destroyed without
+                    // completing must take its pending record with it (memory +
+                    // persisted pref), or the record re-arms as a zombie.
+                    var bsDestroy = buildSiteType.GetMethod("OnDestroy",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+                    if (bsDestroy != null)
+                    {
+                        harmony.Patch(bsDestroy, postfix: new HarmonyLib.HarmonyMethod(
+                            typeof(Relocator).GetMethod(nameof(BuildSiteOnDestroyPostfix), BindingFlags.Public | BindingFlags.Static)));
+                        MelonLogger.Msg("Patched BuildSite.OnDestroy (relocation cancel cleanup)");
+                    }
+                }
+
+                // Destination-marker cancel cleanup: covers cancels at ORDER
+                // stage, before any build site exists.
+                System.Type terrainObjectDestinationType = null;
+                foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    terrainObjectDestinationType = asm.GetType("TerrainObjectDestination");
+                    if (terrainObjectDestinationType != null) break;
+                }
+                if (terrainObjectDestinationType != null)
+                {
+                    var todDestroy = terrainObjectDestinationType.GetMethod("OnDestroy",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+                    if (todDestroy != null)
+                    {
+                        harmony.Patch(todDestroy, postfix: new HarmonyLib.HarmonyMethod(
+                            typeof(Relocator).GetMethod(nameof(RelocationDestinationOnDestroyPostfix), BindingFlags.Public | BindingFlags.Static)));
+                        MelonLogger.Msg("Patched TerrainObjectDestination.OnDestroy (order-stage cancel cleanup)");
                     }
                 }
 
@@ -189,6 +570,11 @@ namespace ForageableTransplantation
                 lastKnownYear = -1;
                 lastKnownDayOfYear = -1;
                 gameManager = null;
+                // Session records belong to the previous map; wipe them, then
+                // re-arm any relocation that was mid-flight when this save was
+                // written — otherwise its placeholder completes as a blueberry.
+                PendingRelocations.Clear();
+                RestorePendingFromPrefs();
                 MelonCoroutines.Start(ScoutForageablePrefabs());
                 MelonCoroutines.Start(ApplyBuildingDataChain());
                 MelonCoroutines.Start(InitializeGameManagerDelayed());
@@ -525,6 +911,41 @@ namespace ForageableTransplantation
                             mrf.SetValue(forageComp, pending.maxReplenishRates);
                     }
                 }
+                else if (pending.savedRates != null && pending.savedRates.Count > 0)
+                {
+                    // Record restored from a save reload: rates were persisted by
+                    // item NAME (live Item refs can't survive a session). Resolve
+                    // them against the game's forage item table and re-apply, so
+                    // the bush keeps its original spawn roll across the reload.
+                    var setAmount = fType.GetMethod("SetAmountToReplenish", flags, null,
+                        new Type[] { typeof(Item), typeof(uint) }, null);
+                    var setMaxAmount = fType.GetMethod("SetMaxAmountToReplenish", flags, null,
+                        new Type[] { typeof(Item), typeof(uint) }, null);
+                    if (setAmount != null)
+                    {
+                        try
+                        {
+                            var forageItems = ForagingManager.foragedItemsRO;
+                            if (forageItems != null)
+                            {
+                                foreach (var item in forageItems)
+                                {
+                                    if (item == null || item.name == null) continue;
+                                    if (pending.savedRates.TryGetValue(item.name, out uint rate))
+                                        setAmount.Invoke(forageComp, new object[] { item, rate });
+                                    if (setMaxAmount != null && pending.savedMaxRates != null
+                                        && pending.savedMaxRates.TryGetValue(item.name, out uint maxRate))
+                                        setMaxAmount.Invoke(forageComp, new object[] { item, maxRate });
+                                }
+                                MelonLogger.Msg($"  Re-applied persisted replenish rates for '{baseName}'.");
+                            }
+                        }
+                        catch (System.Exception ex)
+                        {
+                            MelonLogger.Warning($"  Persisted rate re-apply failed for '{baseName}': {ex.Message}");
+                        }
+                    }
+                }
                 else MelonLogger.Warning("  No saved replenish rates.");
 
                 // Step 3: Reset flags so Unity's Start() -> PostInit() runs fully
@@ -781,11 +1202,10 @@ namespace ForageableTransplantation
                     var f_position = constructionData.GetType().GetField("position", flags);
                     var destPos = f_position != null ? (Vector3)f_position.GetValue(constructionData) : Vector3.zero;
 
-                    if (Vector3.Distance(sceneObj.transform.position, destPos) < 5f)
-                    {
-                        MelonLogger.Msg($"RelocatePrefix: Destination too close to origin for '{baseName}' — ignoring.");
-                        return;
-                    }
+                    // NOTE: no minimum-distance guard here. FF runs the full
+                    // teardown+build flow even for a same-spot relocation, so
+                    // skipping the pending record just left the blueberry
+                    // placeholder as the final bush. Same-spot swaps work fine.
 
                     System.Collections.IDictionary copiedRates = null;
                     System.Collections.IDictionary copiedMaxRates = null;
@@ -839,6 +1259,7 @@ namespace ForageableTransplantation
                         maxReplenishRates = copiedMaxRates,
                         seasonWindows = copiedSeasonWindows
                     };
+                    Relocator.SaveToPrefs(); // survive a save/reload while the placeholder is in flight
 
                     MelonLogger.Msg($"RelocatePrefix: Recorded '{baseName}' (id={instanceId}) -> {destPos}");
                 }
@@ -858,16 +1279,23 @@ namespace ForageableTransplantation
                 if (f_position == null) return;
                 var position = (Vector3)f_position.GetValue(__0);
 
-                foreach (var kvp in new Dictionary<int, Relocator.PendingRelocation>(Relocator.PendingRelocations))
+                // Nearest-match (not first-match) so two relocations with nearby
+                // destinations link to the right site. linkedOnce + ReferenceEquals
+                // ensure a cancelled site's record (Unity-fake-null) can't re-arm
+                // against a later unrelated build site.
+                Relocator.PendingRelocation best = null; float bestDist = 2f;
+                foreach (var kvp in Relocator.PendingRelocations)
                 {
                     var pending = kvp.Value;
-                    if (pending.nativeConstructSite == null
-                        && Vector3.Distance(position, pending.destination) < 2f)
-                    {
-                        pending.nativeConstructSite = buildSiteComp.gameObject;
-                        MelonLogger.Msg($"BuildSiteInitializePostfix: Linked construct site for '{pending.baseName}' (id={kvp.Key}) at {position}");
-                        return;
-                    }
+                    if (pending.linkedOnce || !ReferenceEquals(pending.nativeConstructSite, null)) continue;
+                    float d = Vector3.Distance(position, pending.destination);
+                    if (d < bestDist) { bestDist = d; best = pending; }
+                }
+                if (best != null)
+                {
+                    best.nativeConstructSite = buildSiteComp.gameObject;
+                    best.linkedOnce = true;
+                    MelonLogger.Msg($"BuildSiteInitializePostfix: Linked construct site for '{best.baseName}' at {position} (d={bestDist:F2})");
                 }
             }
             catch (System.Exception ex) { MelonLogger.Error($"BuildSiteInitializePostfix error: {ex}"); }
@@ -903,15 +1331,46 @@ namespace ForageableTransplantation
 
         private static void HandleCompletion(Component buildSiteComp, GameObject blueberryToDestroy)
         {
+            // Only ever destroy a built instance that is actually the blueberry
+            // placeholder (a ForageableResource) — never any other build type.
+            GameObject swapTarget = (blueberryToDestroy != null
+                && blueberryToDestroy.GetComponent("ForageableResource") != null)
+                ? blueberryToDestroy : null;
+
             foreach (var kvp in new Dictionary<int, Relocator.PendingRelocation>(Relocator.PendingRelocations))
             {
                 var pending = kvp.Value;
-                if (pending.nativeConstructSite != null
-                    && pending.nativeConstructSite == buildSiteComp.gameObject)
+                if (!ReferenceEquals(pending.nativeConstructSite, null)
+                    && ReferenceEquals(pending.nativeConstructSite, buildSiteComp.gameObject))
                 {
                     MelonLogger.Msg($"HandleCompletion: Matched '{pending.baseName}' (id={kvp.Key}). Spawning.");
                     Relocator.PendingRelocations.Remove(kvp.Key);
-                    Relocator.SpawnForageableAtDestination(pending.baseName, pending, blueberryToDestroy);
+                    Relocator.SaveToPrefs();
+                    Relocator.SpawnForageableAtDestination(pending.baseName, pending, swapTarget);
+                    return;
+                }
+            }
+
+            // Fallback for restored records that never re-linked (their site
+            // reference died with the old session): nearest-match by position,
+            // gated on the built object being a forageable so no other build
+            // type can ever be swapped or destroyed.
+            if (swapTarget != null)
+            {
+                int bestKey = 0; Relocator.PendingRelocation best = null; float bestDist = 2f;
+                foreach (var kvp in Relocator.PendingRelocations)
+                {
+                    var pending = kvp.Value;
+                    if (pending.linkedOnce || !ReferenceEquals(pending.nativeConstructSite, null)) continue;
+                    float d = Vector3.Distance(buildSiteComp.transform.position, pending.destination);
+                    if (d < bestDist) { bestDist = d; bestKey = kvp.Key; best = pending; }
+                }
+                if (best != null)
+                {
+                    MelonLogger.Msg($"HandleCompletion: Matched restored record by position: '{best.baseName}'. Spawning.");
+                    Relocator.PendingRelocations.Remove(bestKey);
+                    Relocator.SaveToPrefs();
+                    Relocator.SpawnForageableAtDestination(best.baseName, best, swapTarget);
                     return;
                 }
             }

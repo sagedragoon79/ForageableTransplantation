@@ -63,7 +63,7 @@ namespace ForageableTransplantation
 
         private static object NewMeta(string label = null, string tooltip = null,
             object min = null, object max = null, bool restartRequired = false,
-            int order = 0, Func<bool> visibleWhen = null)
+            bool reloadRequired = false, int order = 0, Func<bool> visibleWhen = null)
         {
             var m = Activator.CreateInstance(_settingsMetaType);
             void Set(string field, object value)
@@ -76,6 +76,7 @@ namespace ForageableTransplantation
             Set("Min", min);
             Set("Max", max);
             Set("RestartRequired", restartRequired);
+            Set("ReloadRequired", reloadRequired);
             Set("Order", order);
             Set("VisibleWhen", visibleWhen);
             return m;
@@ -92,18 +93,20 @@ namespace ForageableTransplantation
             Reg("Master", Relocator.ModEnabled,
                 NewMeta("Mod Enabled", "Disable to fall back to vanilla foraging", restartRequired: true));
 
+            // Per-type toggles and gold cost are consumed by ApplyBuildingData
+            // at map load → reload-required (cyan indicator in KC).
             Func<bool> on = () => Relocator.ModEnabled.Value;
-            Reg("Relocate by Type", Relocator.RelocateHerbs,     NewMeta("Herbs", visibleWhen: on));
-            Reg("Relocate by Type", Relocator.RelocateMushrooms, NewMeta("Mushrooms", visibleWhen: on));
-            Reg("Relocate by Type", Relocator.RelocateGreens,    NewMeta("Greens", visibleWhen: on));
-            Reg("Relocate by Type", Relocator.RelocateRoots,     NewMeta("Roots", visibleWhen: on));
-            Reg("Relocate by Type", Relocator.RelocateNuts,      NewMeta("Hazelnuts", visibleWhen: on));
-            Reg("Relocate by Type", Relocator.RelocateWillow,    NewMeta("Willow", visibleWhen: on));
+            Reg("Relocate by Type", Relocator.RelocateHerbs,     NewMeta("Herbs", reloadRequired: true, visibleWhen: on));
+            Reg("Relocate by Type", Relocator.RelocateMushrooms, NewMeta("Mushrooms", reloadRequired: true, visibleWhen: on));
+            Reg("Relocate by Type", Relocator.RelocateGreens,    NewMeta("Greens", reloadRequired: true, visibleWhen: on));
+            Reg("Relocate by Type", Relocator.RelocateRoots,     NewMeta("Roots", reloadRequired: true, visibleWhen: on));
+            Reg("Relocate by Type", Relocator.RelocateNuts,      NewMeta("Hazelnuts", reloadRequired: true, visibleWhen: on));
+            Reg("Relocate by Type", Relocator.RelocateWillow,    NewMeta("Willow", reloadRequired: true, visibleWhen: on));
             Reg("Relocate by Type", Relocator.RelocateBerries,
-                NewMeta("Berry Bushes", "Hawthorn, sumac", visibleWhen: on));
+                NewMeta("Berry Bushes", "Hawthorn, sumac", reloadRequired: true, visibleWhen: on));
 
             Reg("Cost", Relocator.GoldCostToRelocate,
-                NewMeta("Gold Cost per Relocation", min: 0, max: 100, tooltip: "0 = free, just labor"));
+                NewMeta("Gold Cost per Relocation", min: 0, max: 100, tooltip: "0 = free, just labor", reloadRequired: true));
         }
     }
 }
