@@ -6,7 +6,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using System;
 
-[assembly: MelonInfo(typeof(ForageableTransplantation.Relocator), "Forageable Transplantation", "1.1.8", "SageDragoon")]
+[assembly: MelonInfo(typeof(ForageableTransplantation.Relocator), "Forageable Transplantation", "1.1.9", "SageDragoon")]
 [assembly: MelonGame("Crate Entertainment", "Farthest Frontier")]
 
 namespace ForageableTransplantation
@@ -626,7 +626,7 @@ namespace ForageableTransplantation
                     }
                 }
 
-                MelonLogger.Msg("Forageable Transplantation v1.1.4: Init complete.");
+                MelonLogger.Msg($"Forageable Transplantation v{Info.Version}: Init complete.");
 
                 // Note: Keep Clarity registration intentionally happens in
                 // OnSceneWasLoaded("Map"), not here. FT loads alphabetically

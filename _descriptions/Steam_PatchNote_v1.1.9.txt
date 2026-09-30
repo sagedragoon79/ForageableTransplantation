@@ -1,0 +1,19 @@
+[h1]Forageable Transplantation v1.1.9[/h1]
+
+[h2]Faster loading on big maps[/h2]
+[list]
+[*]Relocation setup is much lighter. On a 21,000-forageable map it now takes a few hundredths of a second, down from about a second, and the heavy part happens behind the loading screen.
+[*]The relocate button is ready a few seconds after you take control, even when the game loads paused.
+[*]Loading a second save without quitting no longer leaves the previous map's background checks running.
+[/list]
+
+[h2]No more yearly hitch[/h2]
+[list]
+[*]The mod no longer re-scans the whole map at the start of every in-game year, which caused a brief freeze each New Year on big maps. Forageables that appear during the game still pick up the relocate button.
+[/list]
+
+[h2]Other[/h2]
+[list]
+[*]Your configured gold cost now applies to every relocatable forageable, including ones that inherited the base game's blueberry settings.
+[*]Reminder: Tended Wilds includes everything this mod does and more. If you run both, this mod steps aside, so Tended Wilds users can uninstall it.
+[/list]
