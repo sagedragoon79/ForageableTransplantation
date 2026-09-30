@@ -70,14 +70,22 @@ namespace ForageableTransplantation
         // insertion site rather than assumed from the sign.
         private static int _restoredKeyCounter = -1;
 
+        // FF's save statics go transiently empty during save/scene transitions.
+        // Latch the last good key for this map so a write in that window isn't dropped.
+        private static string _latchedSaveKey = "";
+
         private static string CurrentSaveKey()
+        {
+            string key = ComputeSaveKey();
+            if (!string.IsNullOrEmpty(key)) _latchedSaveKey = key;
+            return _latchedSaveKey;
+        }
+
+        private static string ComputeSaveKey()
         {
             // Settlement name + map seed identify the GAME, not the file —
             // stable across manual saves, autosaves, and Save-As of the same
-            // settlement. Keying by activeSaveFileName broke crash recovery:
-            // FF doesn't reassign it on autosave, so loading "AutoSave 1" after
-            // a crash matched nothing and the placeholder completed as a
-            // blueberry (the exact bug this feature exists to fix).
+            // settlement.
             try
             {
                 string name = SaveManager.activeSettlementName;
@@ -87,7 +95,14 @@ namespace ForageableTransplantation
                         .Replace('\t', ' ').Replace('\n', ' ');
             }
             catch { }
-            try { return (SaveManager.activeSaveFileName ?? "").Replace('\t', ' ').Replace('\n', ' '); }
+            // Fallback: the save FOLDER (one per town), never the raw file name,
+            // which has three shapes for the same town.
+            try
+            {
+                string file = SaveManager.activeSaveFileName;
+                if (string.IsNullOrEmpty(file)) return "";
+                return SaveManager.GameFolder(file).TrimEnd('/').Replace('\t', ' ').Replace('\n', ' ');
+            }
             catch { return ""; }
         }
 
@@ -384,10 +399,83 @@ namespace ForageableTransplantation
         }
 
         public static Dictionary<string, GameObject> ForageablePrefabs = new Dictionary<string, GameObject>();
-        public static GameManager gameManager;
 
-        private static int lastKnownYear = -1;
-        private static int lastKnownDayOfYear = -1;
+        // "Herbs_Patch_Small_01(Clone)" -> "herbs_patch_small_01". Memoized: a map
+        // has thousands of forageables but only a few dozen distinct names, and
+        // Replace+Trim+ToLower allocated three strings per object per scan.
+        private static readonly Dictionary<string, string> _baseNameMemo = new Dictionary<string, string>();
+        internal static string BaseName(string rawName)
+        {
+            if (rawName == null) return "";
+            string b;
+            if (_baseNameMemo.TryGetValue(rawName, out b)) return b;
+            b = rawName.Replace("(Clone)", "").Trim().ToLower();
+            if (_baseNameMemo.Count < 4096) _baseNameMemo[rawName] = b;
+            return b;
+        }
+
+        // Base names whose cache entry is a prefab ASSET (stable for the session).
+        private static readonly HashSet<string> _assetCached = new HashSet<string>();
+
+        // Offer one forageable to the prefab cache. Assets win over scene instances.
+        // Blueberries (vanilla-relocatable) and deco objects are never cached.
+        internal static void RegisterForagePrefab(string rawName, GameObject go)
+        {
+            string baseName = BaseName(rawName);
+            if (baseName.Length == 0 || _assetCached.Contains(baseName)) return;
+            if (baseName.Contains("blueberry") || baseName.Contains("deco")) return;
+            if (!go.scene.IsValid())
+            {
+                ForageablePrefabs[baseName] = go;
+                _assetCached.Add(baseName);
+            }
+            else
+            {
+                GameObject existing;
+                if (!ForageablePrefabs.TryGetValue(baseName, out existing) || existing == null)
+                    ForageablePrefabs[baseName] = go;
+            }
+        }
+
+        // Cached prefab, or one fresh scan (prefab asset preferred over scene instance).
+        internal static GameObject ResolveForagePrefab(string baseName)
+        {
+            if (string.IsNullOrEmpty(baseName)) return null;
+            GameObject prefab;
+            if (ForageablePrefabs.TryGetValue(baseName, out prefab) && prefab != null) return prefab;
+            prefab = null;
+            foreach (var fr in Resources.FindObjectsOfTypeAll<ForageableResource>())
+            {
+                if (fr == null) continue;
+                var go = fr.gameObject;
+                if (go == null) continue;
+                if (BaseName(go.name) != baseName) continue;
+                if (!go.scene.IsValid()) { prefab = go; break; }
+                if (prefab == null) prefab = go;
+            }
+            if (prefab != null) ForageablePrefabs[baseName] = prefab;
+            return prefab;
+        }
+
+        // Bumped on every map load/unload. Coroutines capture it at start and
+        // exit when it changes, so a second save loaded in one session never
+        // leaves the previous map's coroutines running.
+        internal static int _sceneGen = 0;
+
+        // Wait for the save to be fully loaded, on REAL time. Fixed scaled-time
+        // waits stalled for minutes when the game was paused on load.
+        internal static IEnumerator WaitForGameReady(int gen)
+        {
+            yield return new WaitForSecondsRealtime(2f);
+            float cap = 1800f; // new-game setup screens can sit for many minutes
+            while (!GameManager.gameReadyToPlay && cap > 0f && gen == _sceneGen)
+            {
+                cap -= 1f;
+                yield return new WaitForSecondsRealtime(1f);
+            }
+            yield return new WaitForSecondsRealtime(1f);
+        }
+
 
         public override void OnInitializeMelon()
         {
@@ -567,9 +655,8 @@ namespace ForageableTransplantation
 
             if (buildIndex > 0)
             {
-                lastKnownYear = -1;
-                lastKnownDayOfYear = -1;
-                gameManager = null;
+                _sceneGen++; // retires every coroutine started for the previous map
+                _latchedSaveKey = "";
                 // Session records belong to the previous map; wipe them, then
                 // re-arm any relocation that was mid-flight when this save was
                 // written — otherwise its placeholder completes as a blueberry.
@@ -577,9 +664,17 @@ namespace ForageableTransplantation
                 RestorePendingFromPrefs();
                 MelonCoroutines.Start(ScoutForageablePrefabs());
                 MelonCoroutines.Start(ApplyBuildingDataChain());
-                MelonCoroutines.Start(InitializeGameManagerDelayed());
-                MelonCoroutines.Start(YearChangeWatcher());
+                // (YearChangeWatcher removed: it re-ran the full setup, including an
+                // engine-wide scan, every in-game year. Forageables spawned mid-game
+                // inherit relocation data from the stamped prefab assets, the same
+                // design Tended Wilds has used since it dropped its watcher.)
             }
+        }
+
+        public override void OnSceneWasUnloaded(int buildIndex, string sceneName)
+        {
+            // Leaving the map: retire its coroutines.
+            if (buildIndex > 0) _sceneGen++;
         }
 
         // Tracks the result of the most recent ApplyBuildingData run so the
@@ -597,109 +692,36 @@ namespace ForageableTransplantation
         {
             // Pass 1 — initial scan after GlobalAssets is ready (10s wait
             // lives inside ApplyBuildingData itself).
+            int gen = _sceneGen;
             _lastApplyCount = -1;
             yield return ApplyBuildingData();
-            if (_lastApplyCount > 0) yield break;
+            if (_lastApplyCount > 0 || gen != _sceneGen) yield break;
 
             // Pass 2 — safety net for slow saves that hadn't spawned all
             // forageables when pass 1 ran.
-            yield return new WaitForSeconds(30f);
+            yield return new WaitForSecondsRealtime(30f);
+            if (gen != _sceneGen) yield break;
             MelonLogger.Msg("ApplyBuildingData: Pass 1 found 0 forageables — running safety-net pass after +30s.");
             _lastApplyCount = -1;
             yield return ApplyBuildingData();
-            if (_lastApplyCount > 0) yield break;
+            if (_lastApplyCount > 0 || gen != _sceneGen) yield break;
 
             // Pass 3 — last resort for very slow loads.
-            yield return new WaitForSeconds(60f);
+            yield return new WaitForSecondsRealtime(60f);
+            if (gen != _sceneGen) yield break;
             MelonLogger.Msg("ApplyBuildingData: Pass 2 still found 0 — running last-resort pass.");
             yield return ApplyBuildingData();
         }
 
-        private IEnumerator InitializeGameManagerDelayed()
-        {
-            while (gameManager == null)
-            {
-                yield return new WaitForSeconds(2f);
-                gameManager = GameObject.FindObjectOfType<GameManager>();
-                if (gameManager == null)
-                    gameManager = GameObject.Find("GameManager")?.GetComponent<GameManager>();
-                if (gameManager != null)
-                    MelonLogger.Msg("GameManager found!");
-            }
-        }
-
-        private IEnumerator YearChangeWatcher()
-        {
-            yield return new WaitForSeconds(10f);
-            MelonLogger.Msg("YearChangeWatcher: Started.");
-
-            while (true)
-            {
-                yield return new WaitForSeconds(5f);
-
-                if (gameManager == null) continue;
-
-                try
-                {
-                    var tm = gameManager.timeManager;
-                    if (tm == null) continue;
-
-                    var dateObj = tm.GetType()
-                        .GetProperty("currentDate",
-                            BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                        ?.GetValue(tm);
-
-                    if (dateObj == null) continue;
-
-                    var dateType = dateObj.GetType();
-
-                    int currentYear = -1;
-                    var yearProp = dateType.GetProperty("year", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    var yearField = dateType.GetField("year", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (yearProp != null) currentYear = (int)yearProp.GetValue(dateObj);
-                    else if (yearField != null) currentYear = (int)yearField.GetValue(dateObj);
-
-                    int currentDayOfYear = -1;
-                    var dayProp = dateType.GetProperty("dayOfYear", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    var dayField = dateType.GetField("dayOfYear", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                    if (dayProp != null) currentDayOfYear = (int)dayProp.GetValue(dateObj);
-                    else if (dayField != null) currentDayOfYear = (int)dayField.GetValue(dateObj);
-
-                    bool yearChanged = false;
-
-                    if (currentYear != -1 && lastKnownYear != -1 && currentYear != lastKnownYear)
-                    {
-                        yearChanged = true;
-                        MelonLogger.Msg($"YearChangeWatcher: Year changed {lastKnownYear} -> {currentYear}.");
-                    }
-                    else if (currentDayOfYear != -1 && lastKnownDayOfYear != -1
-                             && currentDayOfYear < lastKnownDayOfYear
-                             && lastKnownDayOfYear > 300)
-                    {
-                        yearChanged = true;
-                        MelonLogger.Msg($"YearChangeWatcher: Year rollover detected via dayOfYear ({lastKnownDayOfYear} -> {currentDayOfYear}).");
-                    }
-
-                    if (currentYear != -1) lastKnownYear = currentYear;
-                    if (currentDayOfYear != -1) lastKnownDayOfYear = currentDayOfYear;
-
-                    if (yearChanged)
-                    {
-                        MelonLogger.Msg("YearChangeWatcher: Reapplying building data...");
-                        MelonCoroutines.Start(ApplyBuildingData());
-                    }
-                }
-                catch (System.Exception ex)
-                {
-                    MelonLogger.Error($"YearChangeWatcher error: {ex.Message}");
-                }
-            }
-        }
 
         private IEnumerator ScoutForageablePrefabs()
         {
-            yield return new WaitForSeconds(15f);
-            MelonLogger.Msg("PrefabScout: Starting...");
+            int gen = _sceneGen;
+            yield return WaitForGameReady(gen);
+            // Let the relocation pass go first: it fills the prefab cache from its
+            // own scan during the loading screen, which lets this skip a full scan.
+            yield return new WaitForSecondsRealtime(1f);
+            if (gen != _sceneGen) yield break;
 
             // Single ForageableResource scan replaces the previous three-pass
             // approach (asset GameObject scan + scene GameObject scan +
@@ -721,42 +743,16 @@ namespace ForageableTransplantation
             // SpawnForageableAtDestination lookup format.
             try
             {
-                // Two-pass scan. Prefab assets (scene.IsValid() == false) are
-                // stable across the entire session; scene instances can be
-                // destroyed when the player relocates/harvests them, leaving
-                // the cache holding a Unity-null reference and breaking the
-                // next relocation of the same variant. Pass 1 grabs every
-                // prefab asset; pass 2 fills any remaining variants from
-                // scene instances as a fallback.
-                int loadedPrefabs = 0, loadedInstances = 0;
-                var all = Resources.FindObjectsOfTypeAll<ForageableResource>();
-                foreach (var fr in all)
+                if (ForageablePrefabs.Count == 0)
                 {
-                    if (fr == null) continue;
-                    var go = fr.gameObject;
-                    if (go == null || go.scene.IsValid()) continue; // pass 1: prefabs only
-                    string baseName = go.name.Replace("(Clone)", "").Trim().ToLower();
-                    if (string.IsNullOrEmpty(baseName)) continue;
-                    if (baseName.Contains("blueberry")) continue;
-                    if (baseName.Contains("deco")) continue;
-                    if (ForageablePrefabs.ContainsKey(baseName)) continue;
-                    ForageablePrefabs[baseName] = go;
-                    loadedPrefabs++;
+                    foreach (var fr in Resources.FindObjectsOfTypeAll<ForageableResource>())
+                    {
+                        if (fr == null) continue;
+                        var go = fr.gameObject;
+                        if (go == null) continue;
+                        RegisterForagePrefab(go.name, go);
+                    }
                 }
-                foreach (var fr in all)
-                {
-                    if (fr == null) continue;
-                    var go = fr.gameObject;
-                    if (go == null || !go.scene.IsValid()) continue; // pass 2: scene instances
-                    string baseName = go.name.Replace("(Clone)", "").Trim().ToLower();
-                    if (string.IsNullOrEmpty(baseName)) continue;
-                    if (baseName.Contains("blueberry")) continue;
-                    if (baseName.Contains("deco")) continue;
-                    if (ForageablePrefabs.ContainsKey(baseName)) continue;
-                    ForageablePrefabs[baseName] = go;
-                    loadedInstances++;
-                }
-                MelonLogger.Msg($"PrefabScout: Loaded {loadedPrefabs} prefab asset(s) + {loadedInstances} scene-instance fallback(s).");
             }
             catch (System.Exception ex)
             {
@@ -844,36 +840,14 @@ namespace ForageableTransplantation
 
             MelonLogger.Msg($"SpawnForageableAtDestination: '{baseName}' at {pending.destination}");
 
-            GameObject prefab;
-            ForageablePrefabs.TryGetValue(baseName, out prefab);
-
-            // Cached entry might be Unity-null if it was a scene instance that
-            // got destroyed by a previous relocation/harvest. Or there might be
-            // no entry at all. Either way, re-scan for a fresh prefab asset
-            // before giving up — eliminates the "permanently broken after first
-            // failure" mode the prior cache had.
-            if (prefab == null || !prefab)
+            // Cached prefab, or one fresh scan if the entry is missing or was a
+            // scene instance that has since been destroyed.
+            GameObject prefab = ResolveForagePrefab(baseName);
+            if (prefab == null)
             {
-                foreach (var fr in Resources.FindObjectsOfTypeAll<ForageableResource>())
-                {
-                    if (fr == null) continue;
-                    var go = fr.gameObject;
-                    if (go == null) continue;
-                    if (go.name.Replace("(Clone)", "").Trim().ToLower() != baseName) continue;
-                    if (!go.scene.IsValid()) { prefab = go; break; } // prefer prefab asset
-                    if (prefab == null) prefab = go;                 // scene-instance fallback
-                }
-                if (prefab != null)
-                {
-                    ForageablePrefabs[baseName] = prefab;
-                    MelonLogger.Msg($"SpawnForageableAtDestination: Re-resolved prefab for '{baseName}' (cache was stale).");
-                }
-                else
-                {
-                    MelonLogger.Error($"No prefab found for '{baseName}' after re-scan! Blueberry placeholder will remain.");
-                    ForageablePrefabs.Remove(baseName);
-                    return;
-                }
+                MelonLogger.Error($"No prefab found for '{baseName}' after re-scan! Blueberry placeholder will remain.");
+                ForageablePrefabs.Remove(baseName);
+                return;
             }
 
             GameObject spawned = GameObject.Instantiate(prefab, pending.destination, Quaternion.identity);
@@ -984,9 +958,30 @@ namespace ForageableTransplantation
             }
         }
 
+        // Name filter for relocation: blueberries already relocate in vanilla, deco
+        // objects never do, and each type honors its config toggle.
+        private static bool IsRelocatableForageName(string nameLower)
+        {
+            if (nameLower.Contains("blueberry")) return false;
+            if (nameLower.Contains("deco")) return false;
+            if (nameLower.Contains("herb") && !RelocateHerbs.Value) return false;
+            if (nameLower.Contains("mushroom") && !RelocateMushrooms.Value) return false;
+            if (nameLower.Contains("greens") && !RelocateGreens.Value) return false;
+            if (nameLower.Contains("roots") && !RelocateRoots.Value) return false;
+            if (nameLower.Contains("hazelnut") && !RelocateNuts.Value) return false;
+            if (nameLower.Contains("willow") && !RelocateWillow.Value) return false;
+            if ((nameLower.Contains("hawthorn") || nameLower.Contains("sumac")) && !RelocateBerries.Value) return false;
+            return true;
+        }
+
         private IEnumerator ApplyBuildingData()
         {
-            yield return new WaitForSeconds(10f);
+            int gen = _sceneGen;
+            // Start EARLY, while the loading screen is still up. The one engine-wide
+            // scan this needs (to find the forageable prefab assets) costs about
+            // half a second on a big map; here it is hidden by the load.
+            yield return new WaitForSecondsRealtime(2f);
+            if (gen != _sceneGen) yield break;
 
             var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.FlattenHierarchy;
 
@@ -1022,7 +1017,7 @@ namespace ForageableTransplantation
 
                 if (attempts <= 3 || attempts % 20 == 0)
                     MelonLogger.Warning($"ApplyBuildingData: GlobalAssets not ready yet (attempt {attempts}/{maxAttempts}), retrying...");
-                yield return new WaitForSeconds(2f);
+                yield return new WaitForSecondsRealtime(2f);
             }
 
             if (templateBD == null)
@@ -1077,34 +1072,28 @@ namespace ForageableTransplantation
             int goldCost = GoldCostToRelocate.Value;
 
             int count = 0;
-            // Iterate ForageableResource components directly. This skips the
-            // ~30k-object scene-wide GameObject scan (the dominant cost in
-            // this method) and the per-object string-based GetComponent —
-            // returns only the ~100-500 ForageableResource components, an
-            // O(60-300×) speedup that turns a ~1-second freeze into a few ms
-            // on populated maps. Same source TW switched to.
-            foreach (var comp in Resources.FindObjectsOfTypeAll<ForageableResource>())
+            int alreadyEnabled = 0;
+
+            // Everything loop-invariant is resolved once, up front.
+            var bdField = typeof(ForageableResource).GetField("_buildingData", flags);
+            if (bdField == null)
             {
-                if (comp == null) continue;
-                var obj = comp.gameObject;
-                if (obj == null) continue;
-                if (obj.name.ToLower().Contains("blueberry")) continue;
-                if (obj.name.ToLower().Contains("deco")) continue;
+                MelonLogger.Error("ApplyBuildingData: ForageableResource._buildingData not found.");
+                yield break;
+            }
+            var f_bdIdentifier = typeof(ForageableResource).GetField("buildingDataIdentifier", flags);
+            string templateId = f_identifier?.GetValue(templateBD) as string;
+            var listType = typeof(List<>).MakeGenericType(entryType);
 
-                // Per-type config filter
-                string nameLower = obj.name.ToLower();
-                if (nameLower.Contains("herb") && !RelocateHerbs.Value) continue;
-                if (nameLower.Contains("mushroom") && !RelocateMushrooms.Value) continue;
-                if (nameLower.Contains("greens") && !RelocateGreens.Value) continue;
-                if (nameLower.Contains("roots") && !RelocateRoots.Value) continue;
-                if (nameLower.Contains("hazelnut") && !RelocateNuts.Value) continue;
-                if (nameLower.Contains("willow") && !RelocateWillow.Value) continue;
-                if ((nameLower.Contains("hawthorn") || nameLower.Contains("sumac")) && !RelocateBerries.Value) continue;
+            // One BuildingData per distinct forageable NAME, shared by every
+            // instance of that type (this is how vanilla shares BuildingData).
+            // A big map has ~20,000 forageables but only a few dozen types; the
+            // old code built a BuildingData plus a list for every single one.
+            // A null value means "this type is filtered out".
+            var bdByRawName = new Dictionary<string, object>();
 
-                var bdField = comp.GetType().GetField("_buildingData", flags);
-                if (bdField == null) continue;
-                if (bdField.GetValue(comp) != null) continue;
-
+            object BuildShared(string identifier)
+            {
                 var newBD = System.Activator.CreateInstance(buildingDataType);
                 f_placeablePrefab?.SetValue(newBD, val_placeablePrefab);
                 f_buildSitePrefab?.SetValue(newBD, val_buildSitePrefab);
@@ -1120,9 +1109,8 @@ namespace ForageableTransplantation
                 f_buildGroup?.SetValue(newBD, val_buildGroup);
                 f_buildsiteClearingMode?.SetValue(newBD, val_clearingMode);
                 f_clearDetailsBorder?.SetValue(newBD, val_clearBorder);
-                f_identifier?.SetValue(newBD, obj.name.Replace("(Clone)", "").Trim());
+                f_identifier?.SetValue(newBD, identifier);
 
-                var listType = typeof(List<>).MakeGenericType(entryType);
                 var newList = (System.Collections.IList)System.Activator.CreateInstance(listType);
                 newList.Add(blueberryEntry);
                 f_prefabEntries?.SetValue(newBD, newList);
@@ -1134,23 +1122,94 @@ namespace ForageableTransplantation
                     else
                         f_diagPrefabEntries.SetValue(newBD, System.Activator.CreateInstance(listType));
                 }
-
-                bdField.SetValue(comp, newBD);
-
-                var f_bdIdentifier = comp.GetType().GetField("buildingDataIdentifier", flags);
-                if (f_bdIdentifier != null)
-                {
-                    string templateId = f_identifier?.GetValue(templateBD) as string;
-                    if (templateId != null)
-                        f_bdIdentifier.SetValue(comp, templateId);
-                }
-                count++;
-                if (count <= 5) MelonLogger.Msg($"Enabled transplantation for {obj.name}");
+                return newBD;
             }
 
-            _lastApplyCount = count;
-            if (count > 0)
-                MelonLogger.Msg($"Done! Enabled {count} forageables for transplantation.");
+            void Stamp(ForageableResource comp)
+            {
+                var obj = comp.gameObject;
+                if (obj == null) return;
+                string rawName = obj.name;
+
+                // Feed the prefab cache from the same pass, so the prefab scout
+                // doesn't need its own scan.
+                RegisterForagePrefab(rawName, obj);
+
+                object sharedBD;
+                if (!bdByRawName.TryGetValue(rawName, out sharedBD))
+                {
+                    sharedBD = IsRelocatableForageName(rawName.ToLower())
+                        ? BuildShared(rawName.Replace("(Clone)", "").Trim())
+                        : null;
+                    bdByRawName[rawName] = sharedBD;
+                }
+                if (sharedBD == null) return;
+
+                // Already carries relocation data. The one case to replace: an
+                // instance spawned from a stamped prefab asset inherits only the
+                // identifier string, which the game resolves to the raw blueberry
+                // template — that would ignore the configured gold cost.
+                var current = comp.buildingData;
+                if (current != null && !ReferenceEquals(current, templateBD)) { alreadyEnabled++; return; }
+
+                bdField.SetValue(comp, sharedBD);
+                if (f_bdIdentifier != null && templateId != null)
+                    f_bdIdentifier.SetValue(comp, templateId);
+                count++;
+            }
+
+            // --- Phase A (during load): prefab ASSETS, via one engine-wide scan ---
+            // Stamped assets pass the identifier on to anything spawned from them
+            // later, and they are the stable entries of the prefab cache.
+            var swA = System.Diagnostics.Stopwatch.StartNew();
+            foreach (var comp in Resources.FindObjectsOfTypeAll<ForageableResource>())
+            {
+                if (comp != null) Stamp(comp);
+            }
+            swA.Stop();
+            int earlyCount = count;
+
+            // --- Phase B (save fully loaded): every live forageable, from the
+            // game's own registry. No engine scan, so no hitch after the load. ---
+            yield return WaitForGameReady(gen);
+            if (gen != _sceneGen) yield break;
+
+            var swB = System.Diagnostics.Stopwatch.StartNew();
+            System.Collections.IEnumerable registry = null;
+            try
+            {
+                var gmNow = UnitySingleton<GameManager>.Instance;
+                var rmNow = gmNow != null ? gmNow.resourceManager : null;
+                // Public read-only view of the game's own list of live forageables.
+                if (rmNow != null) registry = rmNow.forageableResourceInstancesRO;
+            }
+            catch { registry = null; }
+
+            if (registry != null)
+            {
+                foreach (var entry in registry)
+                {
+                    var comp = entry as ForageableResource;
+                    if (comp != null) Stamp(comp);
+                }
+            }
+            else
+            {
+                // Registry not reachable (game update?) — fall back to the scan.
+                MelonLogger.Warning("ApplyBuildingData: forageable registry not found — falling back to a full scan.");
+                foreach (var comp in Resources.FindObjectsOfTypeAll<ForageableResource>())
+                {
+                    if (comp != null) Stamp(comp);
+                }
+            }
+            swB.Stop();
+
+            MelonLogger.Msg($"ApplyBuildingData: {earlyCount} enabled during load ({swA.ElapsedMilliseconds} ms), " +
+                $"{count - earlyCount} after load ({swB.ElapsedMilliseconds} ms), {alreadyEnabled} already enabled ({bdByRawName.Count} types).");
+
+            // Forageables that already carry relocation data count as found, so
+            // the chain doesn't run its two safety-net passes for nothing.
+            _lastApplyCount = count + alreadyEnabled;
         }
     }
 
@@ -1185,19 +1244,8 @@ namespace ForageableTransplantation
                     // looking at a Unity-null reference. Prefer a prefab asset
                     // (scene-less) version, fall back to sceneObj only if no
                     // asset exists.
-                    if (!Relocator.ForageablePrefabs.TryGetValue(baseName, out var existing) || existing == null)
-                    {
-                        GameObject prefabAsset = null;
-                        foreach (var fr in Resources.FindObjectsOfTypeAll<ForageableResource>())
-                        {
-                            if (fr == null) continue;
-                            var go = fr.gameObject;
-                            if (go == null || go.scene.IsValid()) continue;
-                            if (go.name.Replace("(Clone)", "").Trim().ToLower() == baseName)
-                            { prefabAsset = go; break; }
-                        }
-                        Relocator.ForageablePrefabs[baseName] = prefabAsset != null ? prefabAsset : sceneObj;
-                    }
+                    if (Relocator.ResolveForagePrefab(baseName) == null)
+                        Relocator.ForageablePrefabs[baseName] = sceneObj;
 
                     var f_position = constructionData.GetType().GetField("position", flags);
                     var destPos = f_position != null ? (Vector3)f_position.GetValue(constructionData) : Vector3.zero;
